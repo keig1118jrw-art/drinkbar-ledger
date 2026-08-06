@@ -1,0 +1,844 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, user-scalable=no" />
+<title>田運ドリンクバー台帳</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Shippori+Mincho:wght@500;700&family=Zen+Kaku+Gothic+New:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --font-display: 'Shippori Mincho', serif;
+    --font-body: 'Zen Kaku Gothic New', sans-serif;
+    --paper: #F2EAD9;
+    --paper-deep: #E8DDC0;
+    --card: #FBF8EF;
+    --ink: #2B2620;
+    --ink-soft: #6B6153;
+    --stamp: #B23A2E;
+    --stamp-soft: #E3D2B8;
+    --moss: #6E7A55;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--paper); }
+  body { font-family: var(--font-body); color: var(--ink); }
+  input, textarea, button { font-family: var(--font-body); font-size: 16px; }
+  #root { min-height: 100vh; }
+  @keyframes spin { from { transform: rotate(0deg);} to { transform: rotate(360deg);} }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<!--
+  ============================================================
+  設定: ここに Google Apps Script のウェブアプリURLと、
+  自分で決めた合言葉(SECRET_TOKEN)を入力してください。
+  ============================================================
+-->
+<script>
+  window.APP_CONFIG = {
+    SCRIPT_URL: "https://script.google.com/macros/s/AKfycbwxWLra7wFFq21H2XOb1bngoOjNn8ka0j1tT_Y2jXNUwjGFKeuD_U3GRNS-QNT6FQ1T1w/exec",
+    TOKEN: "tanun-drinkbar-2026",
+  };
+</script>
+
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useCallback, useRef } = React;
+
+const DEFAULT_DATA = {
+  members: [],
+  payments: [],
+  claims: [],
+  adjustments: [],
+  duesAmount: 200,
+  duesHistory: [],
+  inventory: [
+    { id: "i1", name: "インスタントコーヒー(粉)", lastPurchased: null },
+    { id: "i2", name: "ココア", lastPurchased: null },
+    { id: "i3", name: "味噌汁", lastPurchased: null },
+    { id: "i4", name: "紙コップ", lastPurchased: null },
+  ],
+  purchases: [],
+  notes: [],
+};
+
+const STALE_DAYS = 30;
+
+function uid() {
+  return Math.random().toString(36).slice(2, 10);
+}
+
+function todayStr() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+function daysSince(dateStr) {
+  if (!dateStr) return Infinity;
+  const then = new Date(dateStr);
+  const now = new Date();
+  return Math.floor((now - then) / (1000 * 60 * 60 * 24));
+}
+
+function currentPeriodLabel() {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = d.getMonth() + 1;
+  const startMonth = m % 2 === 1 ? m : m - 1;
+  const endMonth = startMonth + 1;
+  return `${y}年${startMonth}-${endMonth}月`;
+}
+
+function fmtYen(n) {
+  return `¥${n.toLocaleString("ja-JP")}`;
+}
+
+function fmtDate(s) {
+  if (!s) return "";
+  const [y, m, d] = s.split("-");
+  return `${y}/${m}/${d}`;
+}
+
+/* ---------------- storage (Google Apps Script backend) ---------------- */
+async function loadRemote() {
+  const { SCRIPT_URL, TOKEN } = window.APP_CONFIG;
+  const url = `${SCRIPT_URL}?token=${encodeURIComponent(TOKEN)}`;
+  const res = await fetch(url);
+  const json = await res.json();
+  if (!json.ok) throw new Error(json.error || "load failed");
+  return json.value ? JSON.parse(json.value) : null;
+}
+
+async function saveRemote(dataObj) {
+  const { SCRIPT_URL, TOKEN } = window.APP_CONFIG;
+  const res = await fetch(SCRIPT_URL, {
+    method: "POST",
+    headers: { "Content-Type": "text/plain;charset=utf-8" },
+    body: JSON.stringify({ token: TOKEN, value: JSON.stringify(dataObj) }),
+  });
+  const json = await res.json();
+  if (!json.ok) throw new Error(json.error || "save failed");
+  return true;
+}
+
+/* ---------------- App ---------------- */
+function DrinkBarLedger() {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState(null);
+  const [saveState, setSaveState] = useState("idle");
+  const [tab, setTab] = useState("dashboard");
+  const saveTimer = useRef(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const remote = await loadRemote();
+        const merged = { ...DEFAULT_DATA, ...(remote || {}) };
+        merged.claims = (merged.claims || []).map((c) => ({
+          amount: merged.duesAmount,
+          type: "paid",
+          ...c,
+        }));
+        setData(merged);
+      } catch (e) {
+        setLoadError(String(e.message || e));
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, []);
+
+  const persist = useCallback((next) => {
+    setData(next);
+    setSaveState("saving");
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(async () => {
+      try {
+        await saveRemote(next);
+        setSaveState("saved");
+      } catch (e) {
+        setSaveState("error");
+      }
+    }, 250);
+  }, []);
+
+  if (loading) {
+    return (
+      <div style={styles.loadingScreen}>
+        <div style={{ fontSize: 22, animation: "spin 1s linear infinite", display: "inline-block" }}>⏳</div>
+        <div style={{ marginTop: 12, fontSize: 13, color: "#5C5347" }}>台帳を開いています…</div>
+      </div>
+    );
+  }
+
+  if (loadError) {
+    return (
+      <div style={styles.loadingScreen}>
+        <div style={{ fontSize: 22 }}>⚠️</div>
+        <div style={{ marginTop: 12, fontSize: 13, color: "var(--stamp)", textAlign: "center", padding: "0 24px" }}>
+          データの読み込みに失敗しました。<br />
+          index.html 内の SCRIPT_URL / TOKEN の設定と、Apps Script のデプロイ設定(アクセス:全員)を確認してください。
+          <div style={{ marginTop: 8, fontSize: 11, color: "var(--ink-soft)" }}>{loadError}</div>
+        </div>
+      </div>
+    );
+  }
+
+  const totalCollected = data.payments.reduce((s, p) => s + p.amount, 0);
+  const totalAdjustments = data.adjustments.reduce((s, a) => s + a.amount, 0);
+  const totalSpent = data.purchases.reduce((s, p) => s + p.cost, 0);
+  const balance = totalCollected + totalAdjustments - totalSpent;
+  const staleItems = data.inventory.filter((i) => daysSince(i.lastPurchased) >= STALE_DAYS);
+
+  return (
+    <div style={styles.app}>
+      <Header balance={balance} saveState={saveState} />
+      <div style={styles.content}>
+        {tab === "dashboard" && (
+          <Dashboard
+            data={data}
+            persist={persist}
+            totalCollected={totalCollected}
+            totalAdjustments={totalAdjustments}
+            totalSpent={totalSpent}
+            setTab={setTab}
+          />
+        )}
+        {tab === "members" && <MembersTab data={data} persist={persist} />}
+        {tab === "inventory" && <InventoryTab data={data} persist={persist} />}
+        {tab === "handover" && <HandoverTab data={data} persist={persist} />}
+      </div>
+      <BottomNav tab={tab} setTab={setTab} staleCount={staleItems.length} />
+    </div>
+  );
+}
+
+const styles = {
+  app: {
+    fontFamily: "var(--font-body)",
+    background: "var(--paper)",
+    color: "var(--ink)",
+    minHeight: "100vh",
+    boxSizing: "border-box",
+    maxWidth: 480,
+    margin: "0 auto",
+    paddingBottom: 84,
+    position: "relative",
+  },
+  loadingScreen: {
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    justifyContent: "center",
+    minHeight: "100vh",
+    background: "#F2EAD9",
+  },
+  content: { padding: "0 14px 24px" },
+};
+
+function Header({ balance, saveState }) {
+  return (
+    <div style={{ padding: "18px 16px 14px", borderBottom: "2px solid var(--ink)", marginBottom: 16, position: "sticky", top: 0, background: "var(--paper)", zIndex: 5 }}>
+      <div style={{ display: "flex", alignItems: "baseline", gap: 7, marginBottom: 10, flexWrap: "wrap" }}>
+        <span style={{ fontSize: 19 }}>☕</span>
+        <h1 style={{ fontFamily: "var(--font-display)", fontSize: 19, fontWeight: 700, margin: 0, letterSpacing: "0.03em" }}>
+          田運ドリンクバー台帳
+        </h1>
+        <span style={{ fontSize: 11, color: "var(--ink-soft)" }}>(和歌山駅 4番・5番詰所)</span>
+      </div>
+      <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between" }}>
+        <div style={{ fontSize: 11, color: "var(--ink-soft)" }}>会費 残高</div>
+        <div style={{ fontSize: 10, color: "var(--ink-soft)" }}>
+          {saveState === "saving" && "保存中…"}
+          {saveState === "saved" && "保存済み"}
+          {saveState === "error" && "保存に失敗しました"}
+        </div>
+      </div>
+      <div style={{ fontFamily: "var(--font-display)", fontSize: 34, fontWeight: 700, color: balance < 0 ? "var(--stamp)" : "var(--ink)", lineHeight: 1.2 }}>
+        {fmtYen(balance)}
+      </div>
+    </div>
+  );
+}
+
+function BottomNav({ tab, setTab, staleCount }) {
+  const tabs = [
+    { id: "dashboard", label: "ホーム", icon: "📋" },
+    { id: "members", label: "会員・徴収", icon: "👥" },
+    { id: "inventory", label: "購入記録", icon: "📦", badge: staleCount },
+    { id: "handover", label: "引継ぎ", icon: "📝" },
+  ];
+  return (
+    <div style={{ position: "fixed", left: "50%", transform: "translateX(-50%)", bottom: 0, width: "100%", maxWidth: 480, display: "flex", borderTop: "2px solid var(--ink)", background: "var(--card)", paddingBottom: "env(safe-area-inset-bottom, 0px)" }}>
+      {tabs.map((t) => {
+        const active = tab === t.id;
+        return (
+          <button key={t.id} onClick={() => setTab(t.id)} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 3, padding: "9px 4px 8px", border: "none", background: active ? "var(--paper-deep)" : "transparent", color: active ? "var(--stamp)" : "var(--ink-soft)", cursor: "pointer", position: "relative" }}>
+            <span style={{ fontSize: 16 }}>{t.icon}</span>
+            <span style={{ fontSize: 10, fontWeight: 500 }}>{t.label}</span>
+            {!!t.badge && (
+              <span style={{ position: "absolute", top: 4, right: "22%", background: "var(--stamp)", color: "#fff", fontSize: 9, fontWeight: 700, borderRadius: 999, padding: "1px 5px" }}>
+                {t.badge}
+              </span>
+            )}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function Card({ children, style }) {
+  return <div style={{ background: "var(--card)", border: "1.5px solid var(--ink)", borderRadius: 4, padding: 16, ...style }}>{children}</div>;
+}
+
+function SectionTitle({ children }) {
+  return <h2 style={{ fontFamily: "var(--font-display)", fontSize: 15, fontWeight: 700, margin: "0 0 12px" }}>{children}</h2>;
+}
+
+function EmptyHint({ text }) {
+  return <div style={{ fontSize: 13, color: "var(--ink-soft)", padding: "6px 0" }}>{text}</div>;
+}
+
+/* ---------------- Dashboard ---------------- */
+function Dashboard({ data, persist, totalCollected, totalAdjustments, totalSpent, setTab }) {
+  const period = currentPeriodLabel();
+  const totalMembers = data.members.filter((m) => m.active !== false).length;
+  const paidThisPeriod = data.claims.filter((c) => c.period === period).length;
+  const unpaidCount = Math.max(totalMembers - paidThisPeriod, 0);
+  const recentNotes = [...data.notes].sort((a, b) => (a.date < b.date ? 1 : -1)).slice(0, 2);
+
+  return (
+    <div style={{ display: "grid", gap: 14 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+        <StatCard label="累計徴収額" value={fmtYen(totalCollected)} />
+        <StatCard label="累計支出額" value={fmtYen(totalSpent)} />
+      </div>
+
+      <StatCard label={`今期(${period})の未収`} value={`${unpaidCount}名 / ${totalMembers}名`} accent={unpaidCount > 0} onClick={() => setTab("members")} wide />
+
+      <AdjustmentsCard data={data} persist={persist} totalAdjustments={totalAdjustments} />
+      <DuesSettingCard data={data} persist={persist} />
+
+      <Card>
+        <SectionTitle>直近の引継ぎメモ</SectionTitle>
+        {recentNotes.length === 0 ? (
+          <EmptyHint text="まだメモがありません。" />
+        ) : (
+          <div style={{ display: "grid", gap: 8 }}>
+            {recentNotes.map((n) => (
+              <div key={n.id} style={{ fontSize: 13, borderLeft: "3px solid var(--moss)", paddingLeft: 9 }}>
+                <div style={{ color: "var(--ink-soft)", fontSize: 11 }}>{fmtDate(n.date)}</div>
+                <div>{n.text}</div>
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+function StatCard({ label, value, accent, onClick, wide }) {
+  return (
+    <div onClick={onClick} style={{ background: "var(--card)", border: `1.5px solid ${accent ? "var(--stamp)" : "var(--ink)"}`, borderRadius: 4, padding: "12px 14px", cursor: onClick ? "pointer" : "default", gridColumn: wide ? "1 / -1" : "auto" }}>
+      <div style={{ fontSize: 11, color: "var(--ink-soft)", marginBottom: 4 }}>{label}</div>
+      <div style={{ fontFamily: "var(--font-display)", fontSize: 18, fontWeight: 700, color: accent ? "var(--stamp)" : "var(--ink)" }}>{value}</div>
+    </div>
+  );
+}
+
+const ADJUSTMENT_TYPES = [
+  { id: "opening", label: "繰越金" },
+  { id: "donation", label: "支援金" },
+  { id: "other", label: "その他" },
+];
+
+function AdjustmentsCard({ data, persist, totalAdjustments }) {
+  const [open, setOpen] = useState(false);
+  const [type, setType] = useState("opening");
+  const [amount, setAmount] = useState("");
+  const [note, setNote] = useState("");
+
+  const submit = () => {
+    const amt = parseInt(amount, 10);
+    if (!amt) return;
+    persist({ ...data, adjustments: [...data.adjustments, { id: uid(), type, amount: amt, note: note.trim(), date: todayStr() }] });
+    setAmount(""); setNote(""); setOpen(false);
+  };
+
+  const removeAdjustment = (id) => {
+    persist({ ...data, adjustments: data.adjustments.filter((a) => a.id !== id) });
+  };
+
+  const list = [...data.adjustments].sort((a, b) => (a.date < b.date ? 1 : -1));
+  const typeLabel = (id) => ADJUSTMENT_TYPES.find((t) => t.id === id)?.label || "その他";
+
+  return (
+    <Card>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+        <SectionTitle>繰越金・支援金など</SectionTitle>
+        <span style={{ fontSize: 13, color: "var(--ink-soft)" }}>計 {fmtYen(totalAdjustments)}</span>
+      </div>
+      <div style={{ fontSize: 12, color: "var(--ink-soft)", marginBottom: 12 }}>
+        既にある繰越残高や、会員以外からの支援金など、会員の会費とは別の入金をここに記録できます。
+      </div>
+      {list.length > 0 && (
+        <div style={{ display: "grid", gap: 7, marginBottom: 12 }}>
+          {list.map((a) => (
+            <div key={a.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 13 }}>
+              <span>{fmtDate(a.date)} — {typeLabel(a.type)}{a.note ? `(${a.note})` : ""}</span>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span style={{ color: "var(--ink-soft)" }}>{fmtYen(a.amount)}</span>
+                <button onClick={() => removeAdjustment(a.id)} style={{ ...iconBtnStyle, width: 26, height: 26 }}>✕</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+      {!open ? (
+        <button onClick={() => setOpen(true)} style={{ ...primaryBtnStyle, width: "100%", justifyContent: "center" }}>＋ 入金を追加</button>
+      ) : (
+        <div style={{ padding: 10, background: "var(--paper-deep)", borderRadius: 4, display: "grid", gap: 8 }}>
+          <div style={{ display: "flex", gap: 6 }}>
+            {ADJUSTMENT_TYPES.map((t) => (
+              <button key={t.id} onClick={() => setType(t.id)} style={{ flex: 1, fontSize: 12, padding: "7px 4px", borderRadius: 4, border: `1.5px solid ${type === t.id ? "var(--ink)" : "var(--ink-soft)"}`, background: type === t.id ? "var(--ink)" : "transparent", color: type === t.id ? "var(--paper)" : "var(--ink-soft)", cursor: "pointer" }}>
+                {t.label}
+              </button>
+            ))}
+          </div>
+          <input type="number" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="金額(円)" autoFocus style={inputStyle({ width: "100%" })} />
+          <input value={note} onChange={(e) => setNote(e.target.value)} placeholder="メモ(任意)" style={inputStyle({ width: "100%" })} />
+          <div style={{ display: "flex", gap: 8 }}>
+            <button onClick={submit} style={{ ...primaryBtnStyle, flex: 1, justifyContent: "center" }}>記録する</button>
+            <button onClick={() => setOpen(false)} style={{ ...iconBtnStyle, width: 40, height: 40 }}>✕</button>
+          </div>
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function DuesSettingCard({ data, persist }) {
+  const [open, setOpen] = useState(false);
+  const [amount, setAmount] = useState(String(data.duesAmount));
+
+  const submit = () => {
+    const amt = parseInt(amount, 10);
+    if (!amt || amt === data.duesAmount) { setOpen(false); return; }
+    persist({ ...data, duesAmount: amt, duesHistory: [...data.duesHistory, { id: uid(), amount: amt, previousAmount: data.duesAmount, date: todayStr() }] });
+    setOpen(false);
+  };
+
+  const history = [...data.duesHistory].sort((a, b) => (a.date < b.date ? 1 : -1));
+
+  return (
+    <Card>
+      <SectionTitle>会費の設定</SectionTitle>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: open ? 12 : 0 }}>
+        <div style={{ fontSize: 13 }}>
+          現在: <strong style={{ fontFamily: "var(--font-display)", fontSize: 16 }}>{fmtYen(data.duesAmount)}</strong> / 2ヶ月
+        </div>
+        {!open && (
+          <button onClick={() => { setAmount(String(data.duesAmount)); setOpen(true); }} style={{ ...primaryBtnStyle, padding: "7px 12px", fontSize: 12 }}>変更する</button>
+        )}
+      </div>
+      {open && (
+        <div style={{ padding: 10, background: "var(--paper-deep)", borderRadius: 4, display: "grid", gap: 8 }}>
+          <div style={{ fontSize: 11, color: "var(--ink-soft)" }}>変更すると、今後の徴収・前払い消込すべてに新しい金額が使われます。過去の記録はそのままです。</div>
+          <input type="number" value={amount} onChange={(e) => setAmount(e.target.value)} style={inputStyle({ width: "100%" })} autoFocus />
+          <div style={{ display: "flex", gap: 8 }}>
+            <button onClick={submit} style={{ ...primaryBtnStyle, flex: 1, justifyContent: "center" }}>変更を保存</button>
+            <button onClick={() => setOpen(false)} style={{ ...iconBtnStyle, width: 40, height: 40 }}>✕</button>
+          </div>
+        </div>
+      )}
+      {history.length > 0 && (
+        <div style={{ marginTop: 12, display: "grid", gap: 5 }}>
+          {history.map((h) => (
+            <div key={h.id} style={{ fontSize: 11.5, color: "var(--ink-soft)" }}>
+              {fmtDate(h.date)}: {fmtYen(h.previousAmount)} → {fmtYen(h.amount)} に変更
+            </div>
+          ))}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+/* ---------------- Members ---------------- */
+function memberCredit(data, memberId) {
+  const paid = data.payments.filter((p) => p.memberId === memberId).reduce((s, p) => s + p.amount, 0);
+  const claimed = data.claims.filter((c) => c.memberId === memberId).reduce((s, c) => s + (c.amount ?? data.duesAmount), 0);
+  return paid - claimed;
+}
+
+function MembersTab({ data, persist }) {
+  const [newName, setNewName] = useState("");
+  const [payFormFor, setPayFormFor] = useState(null);
+  const [skipFormFor, setSkipFormFor] = useState(null);
+  const period = currentPeriodLabel();
+  const dues = data.duesAmount;
+
+  const addMember = () => {
+    const name = newName.trim();
+    if (!name) return;
+    persist({ ...data, members: [...data.members, { id: uid(), name, active: true }] });
+    setNewName("");
+  };
+
+  const removeMember = (id) => {
+    persist({ ...data, members: data.members.filter((m) => m.id !== id) });
+  };
+
+  const claimFor = (memberId) => data.claims.find((c) => c.memberId === memberId && c.period === period);
+  const isPaidThisPeriod = (memberId) => !!claimFor(memberId);
+
+  const stampPaid = (memberId) => {
+    if (isPaidThisPeriod(memberId)) return;
+    if (memberCredit(data, memberId) >= dues) {
+      persist({ ...data, claims: [...data.claims, { id: uid(), memberId, period, date: todayStr(), amount: dues, type: "paid" }] });
+    } else {
+      setPayFormFor({ memberId, mode: "claim" });
+    }
+  };
+
+  const unstampPaid = (memberId) => {
+    const claim = [...data.claims].reverse().find((c) => c.memberId === memberId && c.period === period);
+    if (!claim) return;
+    persist({ ...data, claims: data.claims.filter((c) => c.id !== claim.id) });
+  };
+
+  const submitPayForm = (amount) => {
+    if (!payFormFor || amount <= 0) return;
+    const { memberId, mode } = payFormFor;
+    const newPayments = [...data.payments, { id: uid(), memberId, amount, date: todayStr() }];
+    if (mode === "claim") {
+      persist({ ...data, payments: newPayments, claims: [...data.claims, { id: uid(), memberId, period, date: todayStr(), amount: dues, type: "paid" }] });
+    } else {
+      persist({ ...data, payments: newPayments });
+    }
+    setPayFormFor(null);
+  };
+
+  const submitSkip = (note) => {
+    if (!skipFormFor) return;
+    const targetIds = skipFormFor === "all" ? data.members.filter((m) => m.active !== false && !isPaidThisPeriod(m.id)).map((m) => m.id) : [skipFormFor];
+    const newClaims = targetIds.map((memberId) => ({ id: uid(), memberId, period, date: todayStr(), amount: 0, type: "skip", note: note.trim() }));
+    persist({ ...data, claims: [...data.claims, ...newClaims] });
+    setSkipFormFor(null);
+  };
+
+  const totalMembers = data.members.filter((m) => m.active !== false).length;
+  const unpaidCount = data.members.filter((m) => m.active !== false && !isPaidThisPeriod(m.id)).length;
+
+  return (
+    <div style={{ display: "grid", gap: 14 }}>
+      {totalMembers > 0 && unpaidCount > 0 && (
+        <Card style={{ borderColor: "var(--moss)", background: "#EFF2E7" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: skipFormFor === "all" ? 12 : 0 }}>
+            <span style={{ fontSize: 16 }}>📝</span>
+            <div style={{ fontSize: 13, flex: 1 }}>今期({period})はまとめて徴収をスキップできます。未収 {unpaidCount}名(全{totalMembers}名)が対象です。</div>
+          </div>
+          {skipFormFor !== "all" ? (
+            <button onClick={() => setSkipFormFor("all")} style={{ ...primaryBtnStyle, marginTop: 10, width: "100%", justifyContent: "center", background: "var(--moss)", borderColor: "var(--moss)" }}>今期は全員スキップにする</button>
+          ) : (
+            <SkipForm label={`未収の${unpaidCount}名をまとめて免除`} onCancel={() => setSkipFormFor(null)} onSubmit={submitSkip} />
+          )}
+        </Card>
+      )}
+
+      <Card>
+        <SectionTitle>今期の徴収 — {period}(基本 {fmtYen(dues)}/回)</SectionTitle>
+        <div style={{ fontSize: 12, color: "var(--ink-soft)", marginBottom: 12 }}>
+          多く受け取った分は「前払い残高」として自動で次回以降に繰り越されます。会費は「ホーム」タブから変更できます。
+        </div>
+
+        {data.members.length === 0 ? (
+          <EmptyHint text="まだ会員が登録されていません。下から追加してください。" />
+        ) : (
+          <div style={{ display: "grid", gap: 8 }}>
+            {data.members.map((m) => {
+              const paid = isPaidThisPeriod(m.id);
+              const claim = claimFor(m.id);
+              const skipped = paid && claim.type === "skip";
+              const credit = memberCredit(data, m.id);
+              const showPayForm = payFormFor && payFormFor.memberId === m.id;
+              const showSkipForm = skipFormFor === m.id;
+              return (
+                <div key={m.id} style={{ border: "1px solid var(--paper-deep)", borderRadius: 4, padding: "10px 10px", background: skipped ? "#EAEEE2" : paid ? "#F5EEDD" : "transparent" }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                    <div>
+                      <div style={{ fontSize: 14 }}>{m.name}</div>
+                      {credit > 0 && <div style={{ fontSize: 11, color: "var(--moss)", marginTop: 2 }}>前払い残高 {fmtYen(credit)}</div>}
+                      {skipped && <div style={{ fontSize: 11, color: "var(--moss)", marginTop: 2 }}>今期は免除{claim.note ? `(${claim.note})` : ""}</div>}
+                    </div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <button onClick={() => (paid ? unstampPaid(m.id) : stampPaid(m.id))} style={{ width: 46, height: 46, borderRadius: "50%", border: `2.5px solid ${skipped ? "var(--moss)" : paid ? "var(--stamp)" : "var(--ink-soft)"}`, background: skipped ? "var(--moss)" : paid ? "var(--stamp)" : "transparent", color: paid ? "#fff" : "var(--ink-soft)", fontFamily: "var(--font-display)", fontWeight: 700, fontSize: 13, cursor: "pointer", transform: paid ? "rotate(-8deg)" : "none", transition: "transform 0.15s ease, background 0.15s ease", flexShrink: 0 }}>
+                        {skipped ? "免" : paid ? "済" : "未"}
+                      </button>
+                      <button onClick={() => removeMember(m.id)} style={iconBtnStyle}>🗑</button>
+                    </div>
+                  </div>
+                  {!paid && !showPayForm && !showSkipForm && (
+                    <div style={{ display: "flex", gap: 12, marginTop: 6 }}>
+                      <button onClick={() => setPayFormFor({ memberId: m.id, mode: "deposit" })} style={linkBtnStyle}>＋入金だけ記録する</button>
+                      <button onClick={() => setSkipFormFor(m.id)} style={linkBtnStyle}>今期は免除にする</button>
+                    </div>
+                  )}
+                  {paid && !skipped && !showPayForm && (
+                    <button onClick={() => setPayFormFor({ memberId: m.id, mode: "deposit" })} style={{ ...linkBtnStyle, marginTop: 6 }}>＋入金だけ記録する(まとめ払いなど)</button>
+                  )}
+                  {showPayForm && (
+                    <PayForm
+                      defaultAmount={payFormFor.mode === "claim" ? dues : ""}
+                      helperText={payFormFor.mode === "claim" ? "今回受け取った金額を入力してください(多ければ自動で繰り越されます)" : "受け取った金額を入力してください(スタンプは押されません)"}
+                      onCancel={() => setPayFormFor(null)}
+                      onSubmit={submitPayForm}
+                    />
+                  )}
+                  {showSkipForm && <SkipForm label={`${m.name}さんを今期は免除`} onCancel={() => setSkipFormFor(null)} onSubmit={submitSkip} />}
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
+          <input placeholder="新しい会員名" value={newName} onChange={(e) => setNewName(e.target.value)} onKeyDown={(e) => e.key === "Enter" && addMember()} style={inputStyle({ flex: 1 })} />
+          <button onClick={addMember} style={primaryBtnStyle}>＋</button>
+        </div>
+      </Card>
+
+      <Card>
+        <SectionTitle>入金履歴</SectionTitle>
+        {data.payments.length === 0 ? <EmptyHint text="まだ入金履歴がありません。" /> : <PaymentHistory data={data} />}
+      </Card>
+    </div>
+  );
+}
+
+function PayForm({ defaultAmount, helperText, onSubmit, onCancel }) {
+  const [amount, setAmount] = useState(String(defaultAmount || ""));
+  return (
+    <div style={{ marginTop: 10, padding: 10, background: "var(--paper-deep)", borderRadius: 4, display: "grid", gap: 8 }}>
+      <div style={{ fontSize: 11, color: "var(--ink-soft)" }}>{helperText}</div>
+      <input type="number" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="円" autoFocus style={inputStyle({ width: "100%" })} />
+      <div style={{ display: "flex", gap: 8 }}>
+        <button onClick={() => onSubmit(parseInt(amount, 10) || 0)} style={{ ...primaryBtnStyle, flex: 1, justifyContent: "center" }}>記録する</button>
+        <button onClick={onCancel} style={{ ...iconBtnStyle, width: 40, height: 40 }}>✕</button>
+      </div>
+    </div>
+  );
+}
+
+function SkipForm({ label, onSubmit, onCancel, style }) {
+  const [note, setNote] = useState("");
+  return (
+    <div style={{ marginTop: 10, padding: 10, background: "var(--paper-deep)", borderRadius: 4, display: "grid", gap: 8, ...style }}>
+      <div style={{ fontSize: 12 }}>{label}</div>
+      <div style={{ fontSize: 11, color: "var(--ink-soft)" }}>入金は記録されません。残高に余裕がある場合の免除に使ってください。</div>
+      <input value={note} onChange={(e) => setNote(e.target.value)} placeholder="理由(任意、例: 支援金を充当)" autoFocus style={inputStyle({ width: "100%" })} />
+      <div style={{ display: "flex", gap: 8 }}>
+        <button onClick={() => onSubmit(note)} style={{ ...primaryBtnStyle, flex: 1, justifyContent: "center", background: "var(--moss)", borderColor: "var(--moss)" }}>免除にする</button>
+        <button onClick={onCancel} style={{ ...iconBtnStyle, width: 40, height: 40 }}>✕</button>
+      </div>
+    </div>
+  );
+}
+
+function PaymentHistory({ data }) {
+  const memberName = (id) => data.members.find((m) => m.id === id)?.name || "(退会済み)";
+  const list = [...data.payments].sort((a, b) => (a.date < b.date ? 1 : -1));
+  return (
+    <div style={{ display: "grid", gap: 7 }}>
+      {list.map((p) => (
+        <div key={p.id} style={{ fontSize: 13, display: "flex", justifyContent: "space-between" }}>
+          <span>{fmtDate(p.date)} — {memberName(p.memberId)}</span>
+          <span style={{ color: "var(--ink-soft)" }}>{fmtYen(p.amount)}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* ---------------- Inventory ---------------- */
+function InventoryTab({ data, persist }) {
+  const [newItem, setNewItem] = useState("");
+  const [openBuy, setOpenBuy] = useState(null);
+
+  const addItem = () => {
+    const name = newItem.trim();
+    if (!name) return;
+    persist({ ...data, inventory: [...data.inventory, { id: uid(), name, lastPurchased: null }] });
+    setNewItem("");
+  };
+
+  const removeItem = (id) => {
+    persist({ ...data, inventory: data.inventory.filter((i) => i.id !== id) });
+  };
+
+  const logPurchase = (itemId, qtyNote, cost) => {
+    const item = data.inventory.find((i) => i.id === itemId);
+    if (!item) return;
+    const date = todayStr();
+    persist({
+      ...data,
+      inventory: data.inventory.map((i) => (i.id === itemId ? { ...i, lastPurchased: date } : i)),
+      purchases: [...data.purchases, { id: uid(), itemId, itemName: item.name, qtyNote, cost, date }],
+    });
+    setOpenBuy(null);
+  };
+
+  return (
+    <div style={{ display: "grid", gap: 14 }}>
+      <Card>
+        <SectionTitle>品目 — 買ったら記録</SectionTitle>
+        <div style={{ fontSize: 12, color: "var(--ink-soft)", marginBottom: 12 }}>本数・個数は追わず、「いつ・何を・いくらで買ったか」だけ記録します。</div>
+        {data.inventory.length === 0 ? (
+          <EmptyHint text="品目がありません。下から追加してください。" />
+        ) : (
+          <div style={{ display: "grid", gap: 10 }}>
+            {data.inventory.map((i) => {
+              const stale = daysSince(i.lastPurchased) >= STALE_DAYS;
+              return (
+                <div key={i.id} style={{ border: "1px solid var(--paper-deep)", borderRadius: 4, padding: 10 }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                    <div>
+                      <div style={{ fontSize: 14 }}>{i.name}</div>
+                      <div style={{ fontSize: 11, color: stale ? "var(--stamp)" : "var(--ink-soft)", marginTop: 2 }}>
+                        {i.lastPurchased ? `最終購入: ${fmtDate(i.lastPurchased)}` : "購入記録なし"}
+                      </div>
+                    </div>
+                    <button onClick={() => removeItem(i.id)} style={iconBtnStyle}>🗑</button>
+                  </div>
+                  {openBuy === i.id ? (
+                    <BuyForm onCancel={() => setOpenBuy(null)} onSubmit={(qtyNote, cost) => logPurchase(i.id, qtyNote, cost)} unit="" />
+                  ) : (
+                    <button onClick={() => setOpenBuy(i.id)} style={{ ...primaryBtnStyle, marginTop: 8, width: "100%", justifyContent: "center" }}>＋ 追加した記録をつける</button>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+        <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
+          <input placeholder="新しい品目名" value={newItem} onChange={(e) => setNewItem(e.target.value)} style={inputStyle({ flex: 1 })} />
+          <button onClick={addItem} style={primaryBtnStyle}>＋</button>
+        </div>
+      </Card>
+
+      <Card>
+        <SectionTitle>購入履歴</SectionTitle>
+        {data.purchases.length === 0 ? (
+          <EmptyHint text="まだ購入記録がありません。" />
+        ) : (
+          <div style={{ display: "grid", gap: 8 }}>
+            {[...data.purchases].sort((a, b) => (a.date < b.date ? 1 : -1)).map((p) => (
+              <div key={p.id} style={{ fontSize: 13, display: "flex", justifyContent: "space-between", gap: 8 }}>
+                <span>{fmtDate(p.date)} — {p.itemName}{p.qtyNote ? ` (${p.qtyNote})` : ""}</span>
+                <span style={{ color: "var(--ink-soft)", flexShrink: 0 }}>{fmtYen(p.cost)}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+function BuyForm({ onSubmit, onCancel }) {
+  const [qtyNote, setQtyNote] = useState("");
+  const [cost, setCost] = useState("");
+  return (
+    <div style={{ marginTop: 10, padding: 10, background: "var(--paper-deep)", borderRadius: 4, display: "grid", gap: 8 }}>
+      <div>
+        <div style={{ fontSize: 11, color: "var(--ink-soft)", marginBottom: 4 }}>数量(例: 2個、1袋、50個入り×1)</div>
+        <input value={qtyNote} onChange={(e) => setQtyNote(e.target.value)} placeholder="2個" style={inputStyle({ width: "100%" })} />
+      </div>
+      <div>
+        <div style={{ fontSize: 11, color: "var(--ink-soft)", marginBottom: 4 }}>金額(会費残高から差し引かれます)</div>
+        <input type="number" value={cost} onChange={(e) => setCost(e.target.value)} placeholder="円" style={inputStyle({ width: "100%" })} />
+      </div>
+      <div style={{ display: "flex", gap: 8 }}>
+        <button onClick={() => { const c = parseInt(cost, 10) || 0; onSubmit(qtyNote.trim(), c); }} style={{ ...primaryBtnStyle, flex: 1, justifyContent: "center" }}>記録する</button>
+        <button onClick={onCancel} style={{ ...iconBtnStyle, width: 40, height: 40 }}>✕</button>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------- Handover ---------------- */
+function HandoverTab({ data, persist }) {
+  const [text, setText] = useState("");
+
+  const addNote = () => {
+    const t = text.trim();
+    if (!t) return;
+    persist({ ...data, notes: [...data.notes, { id: uid(), text: t, date: todayStr() }] });
+    setText("");
+  };
+
+  const removeNote = (id) => {
+    persist({ ...data, notes: data.notes.filter((n) => n.id !== id) });
+  };
+
+  return (
+    <div style={{ display: "grid", gap: 14 }}>
+      <Card>
+        <SectionTitle>担当者への引継ぎメモ</SectionTitle>
+        <textarea value={text} onChange={(e) => setText(e.target.value)} placeholder="次の担当者に伝えたいこと" style={{ ...inputStyle({ width: "100%" }), minHeight: 80, resize: "vertical" }} />
+        <button onClick={addNote} style={{ ...primaryBtnStyle, marginTop: 10, width: "100%", justifyContent: "center" }}>＋ メモを残す</button>
+      </Card>
+      <Card>
+        <SectionTitle>これまでのメモ</SectionTitle>
+        {data.notes.length === 0 ? (
+          <EmptyHint text="まだメモがありません。" />
+        ) : (
+          <div style={{ display: "grid", gap: 10 }}>
+            {[...data.notes].sort((a, b) => (a.date < b.date ? 1 : -1)).map((n) => (
+              <div key={n.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", borderLeft: "3px solid var(--moss)", paddingLeft: 9 }}>
+                <div>
+                  <div style={{ color: "var(--ink-soft)", fontSize: 11 }}>{fmtDate(n.date)}</div>
+                  <div style={{ fontSize: 13, whiteSpace: "pre-wrap" }}>{n.text}</div>
+                </div>
+                <button onClick={() => removeNote(n.id)} style={iconBtnStyle}>✕</button>
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+/* ---------------- shared styles ---------------- */
+function inputStyle(extra) {
+  return { fontSize: 14, padding: "9px 10px", border: "1.5px solid var(--ink-soft)", borderRadius: 4, background: "#fff", color: "var(--ink)", boxSizing: "border-box", ...extra };
+}
+
+const primaryBtnStyle = {
+  display: "flex", alignItems: "center", justifyContent: "center", gap: 4, fontSize: 13, fontWeight: 500,
+  padding: "10px 14px", border: "1.5px solid var(--ink)", borderRadius: 4, background: "var(--ink)", color: "var(--paper)", cursor: "pointer",
+};
+
+const linkBtnStyle = {
+  fontSize: 11.5, color: "var(--moss)", background: "none", border: "none", padding: 0, cursor: "pointer", textDecoration: "underline",
+};
+
+const iconBtnStyle = {
+  display: "flex", alignItems: "center", justifyContent: "center", width: 32, height: 32, border: "1px solid var(--ink-soft)",
+  borderRadius: 4, background: "transparent", color: "var(--ink-soft)", cursor: "pointer", fontSize: 14, flexShrink: 0,
+};
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<DrinkBarLedger />);
+</script>
+</body>
+</html>
